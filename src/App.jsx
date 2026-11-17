@@ -1,8 +1,11 @@
 import { useState, useRef } from "react";
+// Importamos la librería oficial de Mozilla para leer y renderizar archivos PDF en el navegador
 import * as pdfjsLib from "pdfjs-dist";
+// Importamos el "worker" (proceso en segundo plano) para que leer PDFs pesados no congele la pantalla del celular
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
+// Matriz de precios base por hoja según el tipo de papel y el rango de cobertura de color
 const TARIFAS = {
   normal: { bn: 1, color: { bajo: 2, medio: 5, alto: 10 } },
   opalina_delgada: { bn: 2, color: { bajo: 4, medio: 8, alto: 12 } },
@@ -11,11 +14,18 @@ const TARIFAS = {
 };
 
 export default function App() {
+  // Estados de React para controlar la lista de archivos subidos y la interfaz de carga
   const [archivos, setArchivos] = useState([]);
   const [procesando, setProcesando] = useState(false);
   const [estadoActual, setEstadoActual] = useState("");
+
+  // Referencia directa al elemento <canvas> invisible donde "dibujaremos" cada hoja para medir sus píxeles
   const canvasRef = useRef(null);
 
+  /**
+   * Evalúa el costo individual de una sola página.
+   * Si no tiene color, cobra tarifa B/N. Si tiene color, clasifica según el porcentaje de tinta.
+   */
   const calcularCostoPagina = (cobertura, esColor, tipoPapel) => {
     const precios = TARIFAS[tipoPapel];
     if (!esColor) return precios.bn;
@@ -25,6 +35,9 @@ export default function App() {
     return precios.color.alto;
   };
 
+  /**
+   * Suma el costo de todas las páginas que pertenecen a un mismo archivo (útil para PDFs multipágina).
+   */
   const calcularCostoArchivo = (paginas, tipoPapel) => {
     return paginas.reduce(
       (suma, pag) =>
@@ -33,7 +46,12 @@ export default function App() {
     );
   };
 
+  /**
+   * MOTOR DE ANÁLISIS DE PÍXELES (Visión artificial básica)
+   * Recorre la matriz de imagen dibujada en el canvas y clasifica cada píxel.
+   */
   const analizarPixeles = (ctx, width, height) => {
+    // Extrae un arreglo gigante con los valores [R, G, B, Alpha] de cada píxel de la imagen
     const imageData = ctx.getImageData(0, 0, width, height);
     const data = imageData.data;
 
@@ -41,13 +59,18 @@ export default function App() {
     let pixelesColor = 0;
     const totalPixeles = width * height;
 
+    // Avanzamos de 4 en 4 porque cada píxel ocupa 4 espacios en el arreglo (Rojo, Verde, Azul, Transparencia)
     for (let i = 0; i < data.length; i += 4) {
       const r = data[i];
       const g = data[i + 1];
       const b = data[i + 2];
 
+      // Si el píxel no es blanco puro (valores menores a 240 para tolerar fondos ligeramente grises o escaneos), cuenta como tinta
       if (r < 240 || g < 240 || b < 240) {
         pixelesTinta++;
+
+        // En escala de grises o negro, R, G y B tienen valores casi idénticos.
+        // Si la diferencia entre canales supera 20, significa que el píxel tiene un tono de color real.
         const diferenciaMax = Math.max(
           Math.abs(r - g),
           Math.abs(r - b),
@@ -59,11 +82,17 @@ export default function App() {
       }
     }
 
+    // Calculamos el porcentaje total de la hoja que tiene tinta
     const cobertura = (pixelesTinta / totalPixeles) * 100;
+    // Se considera hoja a color solo si más del 0.5% de los píxeles tienen color (evita falsos positivos por ruido)
     const esColor = pixelesColor > totalPixeles * 0.005;
+
     return { cobertura, esColor };
   };
 
+  /**
+   * Procesa archivos de imagen estándar (JPG, PNG, etc.).
+   */
   const analizarImagen = (archivo) => {
     return new Promise((resolve) => {
       const img = new Image();
@@ -72,13 +101,14 @@ export default function App() {
         const canvas = canvasRef.current;
         const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
+        // Redimensionamos la imagen a un máximo de 800px de ancho para no saturar la memoria RAM del celular
         const maxAncho = 800;
         const escala = img.width > maxAncho ? maxAncho / img.width : 1;
         canvas.width = img.width * escala;
         canvas.height = img.height * escala;
 
+        // Dibujamos la imagen escalada en el canvas y ejecutamos el escáner de píxeles
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
         const infoPagina = analizarPixeles(ctx, canvas.width, canvas.height);
 
         resolve({
@@ -91,6 +121,9 @@ export default function App() {
     });
   };
 
+  /**
+   * Procesa documentos PDF página por página de forma secuencial.
+   */
   const analizarPDF = async (archivo) => {
     const arrayBuffer = await archivo.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -104,6 +137,7 @@ export default function App() {
       );
 
       const pagina = await pdf.getPage(i);
+      // Usamos escala 0.5 para renderizar rápido y mantener el consumo de memoria bajo en dispositivos móviles
       const viewport = pagina.getViewport({ scale: 0.5 });
 
       const canvas = canvasRef.current;
@@ -111,11 +145,12 @@ export default function App() {
       canvas.width = viewport.width;
       canvas.height = viewport.height;
 
+      // Renderizamos la página del PDF dentro del canvas y analizamos sus píxeles
       await pagina.render({ canvasContext: ctx, viewport: viewport }).promise;
-
       const infoPagina = analizarPixeles(ctx, canvas.width, canvas.height);
       paginasInfo.push(infoPagina);
 
+      // Limpiamos el canvas inmediatamente después de cada hoja para liberar RAM antes de pasar a la siguiente
       ctx.clearRect(0, 0, canvas.width, canvas.height);
     }
 
@@ -127,6 +162,9 @@ export default function App() {
     };
   };
 
+  /**
+   * Controlador principal cuando el usuario selecciona uno o varios archivos desde el botón.
+   */
   const manejarSubida = async (evento) => {
     setProcesando(true);
     const nuevosArchivos = Array.from(evento.target.files);
@@ -143,12 +181,17 @@ export default function App() {
       }
     }
 
+    // Agregamos los nuevos archivos analizados a los que ya estaban en pantalla
     setArchivos((prev) => [...prev, ...resultados]);
     setProcesando(false);
     setEstadoActual("");
+    // Limpiamos el input para permitir volver a subir el mismo archivo si el usuario lo borra
     evento.target.value = null;
   };
 
+  /**
+   * Actualiza el tipo de papel seleccionado para un archivo específico y recalcula precios automáticamente.
+   */
   const cambiarPapelArchivo = (id, nuevoPapel) => {
     setArchivos((prev) =>
       prev.map((arch) =>
@@ -157,7 +200,7 @@ export default function App() {
     );
   };
 
-  // Cálculos globales del lote
+  // --- CÁLCULOS GLOBALES DE TODO EL LOTE ---
   const totalPaginasLote = archivos.reduce(
     (suma, arch) => suma + arch.paginas.length,
     0,
@@ -167,11 +210,12 @@ export default function App() {
     0,
   );
 
-  // Aplica devaluación de $0.50 por hoja si el lote total llega a 50 o más páginas
+  // Regla de negocio: Si el lote completo suma 50 o más páginas, se descuentan $0.50 por cada hoja
   const descuentoPorVolumen =
     totalPaginasLote >= 50 ? totalPaginasLote * 0.5 : 0;
   const costoTotalLote = costoBaseLote - descuentoPorVolumen;
 
+  // --- INTERFAZ VISUAL (JSX) ---
   return (
     <div
       style={{
@@ -185,6 +229,7 @@ export default function App() {
     >
       <h2>Cotizador Dinámico de Tinta</h2>
 
+      {/* Botón estilizado que oculta el input nativo de archivos */}
       <label
         style={{
           display: "inline-block",
@@ -207,12 +252,15 @@ export default function App() {
         />
       </label>
 
+      {/* Indicador de progreso en tiempo real para PDFs largos */}
       {procesando && (
         <p style={{ color: "#ffeb3b", fontWeight: "bold" }}>{estadoActual}</p>
       )}
 
+      {/* Lienzo oculto donde ocurre todo el procesamiento matemático de imágenes */}
       <canvas ref={canvasRef} style={{ display: "none" }} />
 
+      {/* Lista de tarjetas por cada archivo subido */}
       <div
         style={{
           marginTop: "20px",
@@ -248,6 +296,7 @@ export default function App() {
                   alignItems: "center",
                 }}
               >
+                {/* Selector individual de tipo de papel */}
                 <select
                   value={archivo.tipoPapel}
                   onChange={(e) =>
@@ -279,6 +328,7 @@ export default function App() {
                 </p>
               </div>
 
+              {/* Resumen técnico de páginas, cobertura promedio y detección de color */}
               <p
                 style={{ margin: "8px 0 0 0", color: "#aaa", fontSize: "13px" }}
               >
@@ -300,6 +350,7 @@ export default function App() {
         })}
       </div>
 
+      {/* Caja de resumen final y botón para reiniciar la cotización */}
       {archivos.length > 0 && (
         <div
           style={{
@@ -328,6 +379,7 @@ export default function App() {
             </span>
           </div>
 
+          {/* Solo se muestra si el lote alcanzó las 50 páginas */}
           {descuentoPorVolumen > 0 && (
             <div
               style={{
